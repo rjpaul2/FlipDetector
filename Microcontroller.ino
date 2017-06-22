@@ -1,20 +1,31 @@
+/* @Title: Turning Tracker Microcontroller Code
+ * @Author: Robert J Paul
+ * @Date: 03/04/2017
+ */
+
 //From the article: http://bildr.org/2012/11/force-sensitive-resistor-arduino
 #include "Timer.h" // Library coutesy of Jack Christensen https://github.com/JChristensen/Timer
 /***********************************Global Variables*******************************************/
 int const SMOOTH_NUMBER = 30;
 int const READ_INTERVAL = 100; // How often we take in a sensor reading in milliseconds
-int const CHECK_FLIP_INTERVAL = 2000; // (2sec) How often we check a flip and update (CHECK_FLIP_INTERVAL/1000) * secondsSinceLastFlip
-int const CHECK_NEEDS_FLIP_INTERVAL = 120000; // (2min) How often we check if we need a flip in milliseconds
+int const CHECK_FLIP_INTERVAL = 2000; // (2sec) How often we check a flip and update (CHECK_FLIP_INTERVAL/1000) * secondsSinceLastFlip 
+//int const CHECK_NEEDS_FLIP_INTERVAL = 120000; // (2min) How often we check if we need a flip in milliseconds
+int const CHECK_NEEDS_FLIP_INTERVAL = 10000; // DEMO PURPOSES
 int const BUZZER_PIN = 3; // Pin to output to buzzer
-int const TOLERANCE = 2.0; // Voltage tolerance to register a flip, the lower the TOLERANCE, the higher the sensitivity of flip reporting
+int const LOW_POWER_PIN = 8; //Pin that reads high when the system is of low power and low otherwise
+int const TOLERANCE = 2.0; // Voltage tolerance to register a flip, the lower the TOLERANCE, the higher the sensitivity of flip reporting ASSUMES 3.3V MAX VOLTAGE
 int const STARTING_AVERAGE = 1.1; //(3.3*2)/6 Starting average accross all sensors- NOTE: this assumes that two sensors- max load is an appropriate starting voltage. If a patient takes up 3 or more sensors initially , this can lead to problems in the if statement of checkFlip()
-
-
+//int const NEEDS_FLIP_INTERVAL = 7200; //Doctor-recommended minimum time before a flip is necessary- Should be 2-hours (by US standards)
+int const NEEDS_FLIP_INTERVAL = 90; // DEMO PURPOSES
+//int const WARNING_TIME = 6300; //When the user is first alerted that a flip is necessary - should be 15 minutes before 2-hour mark
+int const WARNING_TIME = 60; // DEMO PURPOSES
 // Global Analog Inputs (SMOOTH_NUMBER readings at each read)
+int const ON_TOLERANCE = 1.0; //Minimum voltage value to register a patient laying "on" the sensor
 float Sensor_A0[SMOOTH_NUMBER]; float Sensor_A1[SMOOTH_NUMBER]; float Sensor_A2[SMOOTH_NUMBER]; float Sensor_A3[SMOOTH_NUMBER]; float Sensor_A4[SMOOTH_NUMBER]; float Sensor_A5[SMOOTH_NUMBER]; 
 float currState[6] = {0.0,0.0,0.0,0.0,0.0,0.0}; // Global current state for each respective 6 analog sensors
 float eqState[6] = {0.0,0.0,0.0,0.0,0.0,0.0}; // Global equilibrium state for 6 analog sensors
-
+bool eqOnSensor[6] = {true,true,true,true,true,true}; //Used for determining the equilibrum sensors the patient is laying on 
+bool currOnSensor[6] = {false,false,false,false,false,false}; //Used for determining the current sensors the patient is laying on 
 // Average equilibrium reading accross all sensors (in Volts) -- used to cut corner cases (i.e. someone leaning on the pad, adding voltage)
 float averageEqReading = STARTING_AVERAGE; 
 
@@ -25,14 +36,16 @@ int readID=0; // timer ID for reading analog inputs
 int packetSenderID=0; //timer ID for continually sending packets in case of no awknowledge 
 int needsFlipCheckID=0; //timer ID for checking if a patient needs a flip
 
-byte currPacket; // Current packet that needs to be sent and awknowledged
+int currPacket; // Current packet that needs to be sent and awknowledged
 bool handlingPacket = false; // If false, the sent packet has been awknowledged and we're waiting f
 
 int readIndex = 0; // Used for smothing inputs
 
 bool soundBuzzer = false; // True until a patient is flipped when needed
-
+bool soundLowPowerBuzzer = false;
 int secondsSinceLastFlip = 0; // Used for telling if a flip is necesary
+
+int numOffSensors = 0; //Number of sensors the patient ISN'T sitting on
 
 /*Function Declarations*/
 void readSensors(void);
@@ -43,18 +56,18 @@ void sendPacket(int ROOM_NUMBER, int ID, int AWK, int TYPE);
 void checkMalfunction(void);
 void buzz(void);
 void checkNeedsFlip(void);
-void sendUntilAWK(byte packet);
-byte convertPacket(int ROOM_NUMBER, int ID, int AWK, int TYPE);
+void sendUntilAWK(int packet);
+int convertPacket(int ROOM_NUMBER, int ID, int AWK, int TYPE);
 
 
 
 /***********************************Serial Process********************************************/
 void setup(){
   /*TODO: figure out a good way to comence all of this (e.g. sensors have certain reading)*/
-  Serial.begin(9600);
+  Serial.begin(115200);
   
-  flipCheckID = t.every(CHECK_FLIP_INTERVAL, checkFlip); // Every CHECK_FLIP_INTERVAL millieconds (2 seconds), check for a flip, TODO: figure out if handlePacket() is going here or in needsFlipCheckID
-  testID = t.every(1500, printTest); // For testing purposes
+  flipCheckID = t.every(CHECK_FLIP_INTERVAL, checkFlip); // Every CHECK_FLIP_INTERVAL milliseconds (2 seconds), check for a flip, TODO: figure out if handlePacket() is going here or in needsFlipCheckID
+  //testID = t.every(1500, printTest); // For testing purposes
   readID = t.every(READ_INTERVAL, readSensors); //Every READ_INTERVAL (100) milliseconds, read the analog inputs, storing a running SMOOTH_NUMBER of inputs in the SensorA arrays
   needsFlipCheckID = t.every(CHECK_NEEDS_FLIP_INTERVAL, checkNeedsFlip); // Every CHECK_NEEDS_FLIP_INTERVAL milliseconds (2min), check if a patient requires a flip
 }
@@ -78,6 +91,8 @@ void readSensors(void){
     updateState(); //At each wrap around, update global state of each sensor -- NOTE: how often the state is updated is directly impacted by SMOOTH_NUMBER and READ_INTERVAL
     //TODO: maybe put checkFlip here to decrease # of timers?, have to be careful because how often we check the sensors and SMOOTH_NUMBER can alter how often we check for a flip
   }
+  if(digitalRead(LOW_POWER_PIN) == HIGH){soundLowPowerBuzzer = true;}
+  else{soundLowPowerBuzzer = false;}
 }
 
 /* Updates equilibrium state of sensor - for use when a flip is registered and the patient settles down to a new position
@@ -96,30 +111,88 @@ void updateState(void){
   }
   // Uses the running sum to find the running average of SMOOTH_NUMBER of readings
   currState[0] = total_SensorA0/SMOOTH_NUMBER;currState[1] = total_SensorA1/SMOOTH_NUMBER;currState[2] = total_SensorA2/SMOOTH_NUMBER;currState[3] = total_SensorA3/SMOOTH_NUMBER;currState[4] = total_SensorA4/SMOOTH_NUMBER;currState[5] = total_SensorA5/SMOOTH_NUMBER;
+  // Update the current sensors that are being lain on
+  numOffSensors = 0;
+  for(int i = 0; i < 6; i++){
+    if(currState[i] > ON_TOLERANCE){currOnSensor[i] = true;}
+    else{
+      currOnSensor[i] = false;
+      numOffSensors++; // Update the global sensors we are not on for use in stopping the state when pad inactive
+    }  
+  }
 }  
 /*Returns average reading (in Volts) accross all sensors in current state*/
 float getAverageReading(void){
   return (currState[0] + currState[1] + currState[2] + currState[3] + currState[4] + currState[5])/6;
 }
-/* Updates the equilibrium state and sets the flip timer to 0 if a flip is registers, does nothing if no flip otherwise*/
+/* Updates the equilibrium state and sets the flip timer to 0 if a flip is registers, does nothing if no flip otherwise
+*NOTE: Spamming flip may stall the server (see handlePackets() in the WiFi Module
+*/
 void checkFlip(void){
   //buzz();
   handlePacket(); // Check to see if any packet needs to be sent back to the Wifi Module TODO: Put this somewhere less frequently called
   secondsSinceLastFlip += 2; // Every second, update our timer keeping track of the current time since our last flip (because this is called every two seconds, we can just add 2)
+  if(soundBuzzer && secondsSinceLastFlip % 8 == 0){buzz();} //Chirp the buzzer until a flip is registered TODO: maybe put this somewhere more frequent?
+  if(soundLowPowerBuzzer && secondsSinceLastFlip % 10 == 0){buzz_LOW_POWER();}
+  //new stuff
+  
+  bool sensor0Changed = false, sensor1Changed = false, sensor2Changed = false, sensor3Changed = false, sensor4Changed = false, sensor5Changed = false;
+  bool weightShift = false;
+
+  /* Figure out which sensors have "changed" values */
+  if(abs(eqState[0]-currState[0]) > TOLERANCE)
+    sensor0Changed = true;
+  if(abs(eqState[1]-currState[1]) > TOLERANCE)
+    sensor1Changed = true;
+  if(abs(eqState[2]-currState[2]) > TOLERANCE)
+    sensor2Changed = true; 
+  if(abs(eqState[3]-currState[3]) > TOLERANCE)
+    sensor3Changed = true;
+  if(abs(eqState[4]-currState[4]) > TOLERANCE)
+    sensor4Changed = true;
+  if(abs(eqState[5]-currState[5]) > TOLERANCE)
+    sensor5Changed = true;
+
+  /*If we're not on any of the sensors, restart the state machine*/
+  if(numOffSensors == 6){
+    for(int i = 0; i < 6; i++)
+      eqOnSensor[i] = true;
+  }
+  
+  /* Figure out if wieghts have shifted for corner case */
+  if(eqOnSensor[0])
+    if(!currOnSensor[0])
+      weightShift = true;
+  if(eqOnSensor[1])
+    if(!currOnSensor[1])
+      weightShift = true;
+  if(eqOnSensor[2])
+    if(!currOnSensor[2])
+      weightShift = true;
+  if(eqOnSensor[3])
+    if(!currOnSensor[3])
+      weightShift = true;
+  if(eqOnSensor[4])
+    if(!currOnSensor[4])
+      weightShift = true;
+  if(eqOnSensor[5])
+    if(!currOnSensor[5])
+      weightShift = true;
+ 
   //if any sensor deviates from its smooth value by TOLERANCE Volts AND a high average increase in voltage is not registered (i.e. someone sitting on the bed, applying force to sensor), a flip is registered
-  if((abs(eqState[0]-currState[0]) > TOLERANCE || abs(eqState[1]-currState[1]) > TOLERANCE || abs(eqState[2]-currState[2]) > TOLERANCE
-  || abs(eqState[3]-currState[3]) > TOLERANCE || abs(eqState[4]-currState[4]) > TOLERANCE || abs(eqState[5]-currState[5]) > TOLERANCE) 
-  && (getAverageReading() - averageEqReading) < (TOLERANCE / 6)){// Where TOLERANCE / 6 is the minimum additional average voltage to register as an outside force, not the patient, adding voltage to the pad -- TODO: test average stuff
+  if((sensor0Changed || sensor1Changed || sensor2Changed || sensor3Changed || sensor4Changed ||sensor5Changed) && (weightShift)){
+  //&& (getAverageReading() - averageEqReading) < (TOLERANCE / 6)){// Where TOLERANCE / 6 is the minimum additional average voltage to register as an outside force, not the patient, adding voltage to the pad -- TODO: test average stuff
     // If we detect a flip, update the equilibrium state to be the current state
     for(int i = 0; i < 6; i++){
       eqState[i] = currState[i];
+      eqOnSensor[i] = currOnSensor[i];
      }
     // TODO: THIS AVERAGE SHIT MAY LEAD TO PROBLEMS need to know the perfect moment to 'record' EQ average initially (maybe 6v initially?)
-    if(getAverageReading() > STARTING_AVERAGE) // Cuts off averageEqReading from dropping too low, making the outlying if statement unreachable, used if a patient uses more than 6.6V continually
-      averageEqReading = getAverageReading(); // Update equilibrium average across all sensors 
+    //if(getAverageReading() > STARTING_AVERAGE) // Cuts off averageEqReading from dropping too low, making the outlying if statement unreachable, used if a patient uses more than 6.6V continually
+      //averageEqReading = getAverageReading(); // Update equilibrium average across all sensors 
     secondsSinceLastFlip = 0; //Reset timer
     soundBuzzer = false; //Shut up the buzzer
-    Serial.println("FLIPPED\n");
+    //Serial.println("FLIPPED\n");
     sendPacket(0,0,0,0); //FLIPPED TODO: check if the sent packet is output to the module when a flip occurs (and echoed)
   }
 }
@@ -141,8 +214,8 @@ void sendPacket(int ROOM_NUMBER, int ID, int AWK, int TYPE){
 }
 
 /*Converts packet from [ROOM_NUMBER, ID, AWK, TYPE] to | 0 | 0 | 0 | 0 | ROOM_NUMBER | ID | AWK | TYPE |*/
-byte convertPacket(int ROOM_NUMBER, int ID, int AWK, int TYPE){
-  byte packet = 00000000;
+int convertPacket(int ROOM_NUMBER, int ID, int AWK, int TYPE){
+  int packet = 00000000;
   // Convert to form | 0 | 0 | 0 | 0 | ROOM_NUMBER | ID | AWK | TYPE |
   packet += (TYPE) & 15;
   packet += (AWK << 1) & 15;
@@ -166,9 +239,14 @@ void checkMalfunction(void){
 
 /*Sounds buzzer every ??? seconds until patient is flipped*/
 void buzz(void){
-  tone(BUZZER_PIN, 2000, 500); // 2000 HZ for 500 milliseconds
+  tone(BUZZER_PIN, 4000, 200); // 4000 HZ for 500 milliseconds
+  //tone(BUZZER_PIN, 65000, 1000);
 }
-/* Continually anaylize global packet. If the packet is recieved back by readPacket() and AWK=0 is read, we keep on writing the packet until AWK =1 is read. The frequency of this function is specified by TODO:???
+/*Seperate buzzer indicating low power*/
+void buzz_LOW_POWER(void){
+  tone(BUZZER_PIN, 5000, 100);
+}
+/* Continually anaylize global packet. If the packet is recieved back by readPacket() and AWK=0 is read, we keep on writing the packet until AWK =1 is read. The frequency of this function is specified by CHECK_FLIP_INTERVAL milliseconds
  * Here we expect the Wifi Module to send back a packet once with either AWK = 0 or AWK = 1 (maybe try to send the signal over 2 minutes until AWK=1, else send back with AWK=0)
  * Note that the Wifi Module will continually get signals until an AWK = 1 is sent and receieved
  */
@@ -186,12 +264,19 @@ void handlePacket(void){
 
 /*Continually attemps to alert the nurse that a flip is nesasarry, upon no flip and/or no AWK, we alert our emergency buzzer - Do nothing else*/
 void checkNeedsFlip(void){
-  if(soundBuzzer){buzz();} //Chirp the buzzer until a flip is registered TODO: maybe put this somewhere more frequent?
-  if(secondsSinceLastFlip > 6300 && secondsSinceLastFlip<7200){ //15 minute warning
-   sendPacket(0,0,0,1);//TODO: also be careful here, because checkNeedsFlip goes every couple of minutes
+  //Serial.print(secondsSinceLastFlip);
+  /*If the pad isn't being used, act as a constant flip, so we're not informed about a NEEDS_FLIP*/
+  if(numOffSensors == 6){
+    secondsSinceLastFlip = 0;
   }
-  else if(secondsSinceLastFlip > 7200){// Two-hours expired
+  
+  if(secondsSinceLastFlip > WARNING_TIME && secondsSinceLastFlip < NEEDS_FLIP_INTERVAL){ //15 minute warning
+   sendPacket(0,0,0,1);//TODO: also be careful here, because checkNeedsFlip goes every couple of minutes
+   //Serial.println("NEEDS FLIPPING");
+  }
+  else if(secondsSinceLastFlip > NEEDS_FLIP_INTERVAL){// Two-hours expired
     soundBuzzer = true;//TODO: Figure out a way to terminate this upon flip
+    //Serial.print("BUZZ!");
   }
 }
 
